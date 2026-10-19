@@ -160,10 +160,13 @@ let _buildAutoInjection:
   | null
   | undefined = undefined;
 
-// Pending context to inject via the 'context' hook (avoiding systemPrompt mutation
-// which breaks prefix prompt cache on DeepSeek/Anthropic/OpenAI).
-// See: https://github.com/mksglu/context-mode/issues/598
-let _pendingContext = "";
+// Last run-start context persisted into the Pi transcript (see before_agent_start).
+// It is delivered once as a persisted custom message instead of a request-local
+// message, so the provider prefix stays byte-identical on every later request
+// (mutating systemPrompt or adding a message to one request only both break the
+// DeepSeek/Anthropic/OpenAI prefix cache). See issue #598.
+// Reset on session_start / session_compact, when the transcript no longer holds it.
+let _lastInjectedContext = "";
 async function getAutoInjection(
   pluginRoot: string,
 ): Promise<((events: Array<{ category: string; data: string }>) => string) | null> {
@@ -467,6 +470,7 @@ export default function piExtension(pi: any): void {
   pi.on("session_start", (_event: any, ctx: any) => {
     try {
       _sessionId = deriveSessionId(ctx ?? {});
+      _lastInjectedContext = "";
       db.ensureSession(_sessionId, projectDir);
       db.cleanupOldSessions(7);
     } catch {
@@ -606,7 +610,6 @@ export default function piExtension(pi: any): void {
 
   pi.on("before_agent_start", async (event: any, ctx: any) => {
     try {
-      _pendingContext = ""; // Reset — will be filled below if events exist
       // Lazily start and await the MCP bridge only when Pi is about to
       // dispatch a real agent turn. This is the non-brittle #534/#809 guard:
       // help/version/package/config CLI paths may load the extension, but they
@@ -715,40 +718,29 @@ export default function piExtension(pi: any): void {
         db.markResumeConsumed(_sessionId);
       }
 
-      // Store extra context (routing anchor, active_memory, resume, behavioralDirective)
-      // for injection via the 'context' hook as a message, NOT as a systemPrompt
-      // modification. Mutating systemPrompt breaks prefix prompt caching on
-      // DeepSeek/Anthropic/OpenAI because the system message sits at messages[0]
-      // and any change invalidates the entire cache chain.
+      // Deliver the extra context (routing anchor, active_memory, resume) as a
+      // PERSISTED custom message returned from before_agent_start, NOT as a
+      // systemPrompt modification and NOT as a request-local message appended by
+      // the 'context' hook. Pi stores the message in the session transcript right
+      // after the user prompt, so every later request of this run (and later runs)
+      // replays the same bytes at the same position. A request-local message
+      // would exist only on the run's first request and make request 2 diverge
+      // from the cache entry request 1 wrote. Only emit when the text changed, so
+      // the unchanged anchor is not re-added to the history on every run.
       const baseLen = existingPrompt ? 1 : 0;
-      if (parts.length > baseLen) {
-        const extraParts = parts.slice(baseLen);
-        _pendingContext = extraParts.join("\n\n");
-      } else {
-        _pendingContext = "";
-      }
+      if (parts.length <= baseLen) return;
+      const extra = parts.slice(baseLen).join("\n\n");
+      if (!extra || extra === _lastInjectedContext) return;
+      _lastInjectedContext = extra;
+      return {
+        message: {
+          customType: "context-mode",
+          content: extra,
+          display: false,
+        },
+      };
     } catch {
-      _pendingContext = ""; // Reset — ensure no stale data escapes
       // best effort — never break agent start
-    }
-  });
-
-  // ── 4a2. context — Inject active_memory + resume + behavioralDirective as message ──
-  // Uses the 'context' hook (like hindsight does) to append context at the END of
-  // messages rather than mutating systemPrompt at the beginning. This preserves
-  // prefix prompt cache for DeepSeek, Anthropic, and OpenAI.
-  pi.on("context", (event: any) => {
-    try {
-      if (!_pendingContext) return;
-      const ctx = _pendingContext;
-      _pendingContext = "";
-      event.messages.push({
-        role: "user",
-        content: ctx,
-      });
-      return { messages: event.messages };
-    } catch {
-      // best effort — never break context assembly
     }
   });
 
@@ -851,6 +843,9 @@ export default function piExtension(pi: any): void {
     } catch {
       // best effort
     }
+    // Compaction summarises the transcript, including any persisted context
+    // message — re-inject on the next run.
+    _lastInjectedContext = "";
   });
 
   // ── 7. session_shutdown — Cleanup old sessions ─────────
